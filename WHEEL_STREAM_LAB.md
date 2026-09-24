@@ -4,12 +4,21 @@
 
 The Logitech G920 plugs into your laptop. A **proxy** program on the laptop
 reads the wheel and sends its state to the Pi as UDP packets. On the Pi,
-`wheel_monitor` decodes each packet and prints steering, throttle, brake, and
-buttons continuously, like a serial monitor.
+upstream's `proxy_receiver` prints the steering, throttle and brake values as
+they arrive, and sends a test "force" byte back so you can see the return path
+working too.
 
 ```
-G920 ──USB──> laptop (proxy) ──UDP port 8000──> Raspberry Pi 4 (wheel_monitor)
+G920 ──USB──> laptop (proxy) ──UDP :8000──> Raspberry Pi 4 (proxy_receiver)
+                          <──UDP :8001── (force byte)
 ```
+
+This is a refactor of the upstream's own test procedure for Windows (originally written exclusively for Windows, now adapted for MacOS), written out step by step with the setup
+details filled in. The short version lives in the repo's
+[README.md](README.md), under "Proxy Application Test"
+([same section on GitHub](https://github.com/arjunr2/logitech-wheel-dev#proxy-application-test)).
+
+If you are on Windows, you should follow the README. If you are on MacOS, follow the instructions below. Note, this was written with Apple Silicon in mind, x86 has not been tested. 
 
 There are two proxies. They send byte-identical packets, so the Pi side is the
 same either way:
@@ -29,12 +38,22 @@ the whole thing, brackets included, with your own value.
 
 | Machine | Files | Software |
 |---|---|---|
-| Raspberry Pi 4 | `proxy_receiver/wheel_monitor.c`, `proxy_receiver/state.h` | `gcc` (preinstalled on Raspberry Pi OS) |
+| Raspberry Pi 4 | the `proxy_receiver/` folder (`receiver.c`, `state.h`) | `gcc` (preinstalled on Raspberry Pi OS) |
 | Mac | `mac_proxy.py` | Python 3, `pygame-ce` |
 | Windows | `proxy_gui.py`, `logitech_steering_wheel/` folder | Python 3, `PyQt5`, Logitech G HUB or Logitech Gaming Software |
 
 Both the laptop and the Pi must be on the same network: both on CMU-SECURE,
 both on the same home Wi-Fi, or joined directly by an Ethernet cable.
+
+**Both programs have their addresses compiled or written in**, so collect two
+addresses before you start:
+
+- `<pi-ip>` — the Pi's address, from `hostname -I` on the Pi
+- `<laptop-ip>` — the laptop's address, from `ipconfig` (Windows) or
+  `ipconfig getifaddr en0` (macOS Wi-Fi)
+
+Campus addresses change between sessions, so re-check them whenever something
+that used to work stops working.
 
 ---
 
@@ -46,48 +65,54 @@ both on the same home Wi-Fi, or joined directly by an Ethernet cable.
 hostname -I
 ```
 
-Write down the first address shown. This handout calls it `<pi-ip>`. Campus
-IPs can change between sessions, so check again whenever things stop working.
+The first address shown is `<pi-ip>`.
 
-**1.2** Copy the two files to the Pi. From the laptop, in the repo folder
+**1.2** Copy the receiver folder to the Pi. From the laptop, in the repo folder
 (this works from macOS Terminal and from Windows PowerShell):
 
 ```
-ssh <pi-user>@<pi-ip> "mkdir -p ~/proxy_receiver"
-scp proxy_receiver/wheel_monitor.c proxy_receiver/state.h <pi-user>@<pi-ip>:~/proxy_receiver/
+scp -r proxy_receiver <pi-user>@<pi-ip>:~/
 ```
 
-A USB stick works too. The two files just need to end up in the same folder.
+A USB stick works too; `receiver.c` and `state.h` just need to end up in the
+same folder.
 
-**1.3** Build the monitor on the Pi:
+**1.3** Set the addresses. On the Pi, open `~/proxy_receiver/receiver.c` and
+edit the block marked `/** Configure this **/` near the top:
+
+```c
+#define LOCAL_HOST "<pi-ip>"      // this Pi's own address
+#define R_PORT 8000               // leave as is
+
+#define REMOTE_HOST "<laptop-ip>" // where the force byte is sent back
+#define S_PORT 8001               // leave as is
+```
+
+`LOCAL_HOST` must be an address this Pi actually has, or the program exits at
+startup with `bind failed`. These are `#define`s, so changing them means
+recompiling (step 1.4).
+
+**1.4** Build it, exactly as the README says:
 
 ```
 cd ~/proxy_receiver
-gcc -O2 -Wall -o wheel_monitor wheel_monitor.c
+gcc -pthread receiver.c -o proxy_receiver
 ```
+
+`-pthread` is required: the receiver runs its force-sending loop in a second
+thread.
 
 > **Checkpoint:** no output means it built.
 
-**1.4** Start it:
+**1.5** Run it:
 
 ```
-./wheel_monitor -r
+./proxy_receiver
 ```
 
-> **Checkpoint:** it prints `Listening on 0.0.0.0:8000 ...` followed by
-> `-- no packets for Ns` once a second. That's expected, because nothing is
-> sending yet. Leave it running and continue with Part 2A or 2B.
-
-Options:
-
-| Flag | Effect |
-|---|---|
-| `-r` | also print the raw index of every pressed button |
-| `-n <N>` | print every Nth packet only (drops and restarts are still reported) |
-| `-p <port>` | listen on a different port (default 8000) |
-
-`wheel_monitor` and the upstream `receiver.c` both use port 8000, so only one
-can run at a time.
+> **Checkpoint:** it prints `Send force 0`, `Send force 5`, `Send force 10` …
+> about three times a second. That's the return path, and it runs whether or
+> not a proxy is connected. Leave it running and go to Part 2A or 2B.
 
 ---
 
@@ -143,11 +168,12 @@ python3 mac_proxy.py --remote <pi-ip> --steer <steer-axis> --throttle <throttle-
 - If a pedal read **−1** when released, add `--invert-throttle` and/or
   `--invert-brake`.
 - If macOS asks whether Python may accept incoming network connections, click
-  **Allow**. That's for the return channel.
+  **Allow**. That's for the force byte coming back.
 
 > **Checkpoint:** the Mac shows `steer ... thr ... brk ... sent N` with N
-> counting up, and `force --`. The `--` is expected, because `wheel_monitor`
-> never sends anything back.
+> counting up, and a `force` value that changes every 300 ms. The force value
+> is the receiver's test counter, not real force feedback: the Mac proxy only
+> displays it.
 
 Go to Part 3.
 
@@ -160,7 +186,7 @@ Gaming Software 5.10**. The current **G HUB** is also expected to work with
 the SDK. If the proxy can't connect with one, try the other.
 
 If Windows installed its own driver for the wheel before the Logitech
-software, the SDK won't see the wheel. Fix it this way:
+software, the SDK won't see the wheel. Upstream's fix:
 
 1. Plug in and power the wheel.
 2. In Device Manager, uninstall the driver Windows installed, and leave the
@@ -184,16 +210,7 @@ Always run the proxy from the repo folder. `proxy_gui.py` imports the
 `logitech_steering_wheel` folder that sits next to it, and that folder
 contains the Logitech DLLs.
 
-**2B.3** Find the laptop's own IP address:
-
-```
-ipconfig
-```
-
-Use the IPv4 address of the adapter that is on the same network as the Pi.
-This handout calls it `<laptop-ip>`.
-
-**2B.4** Configure the proxy. Open `proxy_gui.py` and edit the block marked
+**2B.3** Configure the proxy. Open `proxy_gui.py` and edit the block marked
 `## Configure this ##` near the top:
 
 ```python
@@ -208,7 +225,7 @@ R_PORT = 8001                # leave as is
 proxy crashes on startup with an `OSError` about the requested address. Don't
 commit these edits; the addresses are specific to your setup.
 
-**2B.5** Plug in the wheel (power brick first, then USB), then start the proxy:
+**2B.4** Plug in the wheel (power brick first, then USB), then start the proxy:
 
 ```
 python proxy_gui.py
@@ -217,16 +234,14 @@ python proxy_gui.py
 If Windows Defender Firewall asks about Python, allow it on the network type
 you're using.
 
-**2B.6** In the window that opens, click **connect**.
+**2B.5** In the window that opens, click **connect**.
 
 > **Checkpoint:** the console prints `initialized successfully` and
 > `connected to a steering wheel at index 0`, and the wheel gives a short
-> bump. The three number boxes in the window show steering, throttle, and
-> brake, and they change as you move the controls.
-
-The console will also print `No data` many times a second. That's expected:
-the proxy looks for a return (force) packet on every tick, and `wheel_monitor`
-never sends one.
+> bump. The three number boxes in the window show steering, throttle and
+> brake, and they change as you move the controls. Once the Pi's receiver is
+> running you also get `Received | (Pkt N) : <force>` lines, and the wheel
+> applies that value as a constant force.
 
 Keep the proxy window open. **stop** disconnects from the wheel.
 
@@ -234,53 +249,45 @@ Keep the proxy window open. **stop** disconnects from the wheel.
 
 ## Part 3: Verify on the Pi
 
-Once the proxy is sending, `wheel_monitor` prints
-`== receiving from <laptop-ip>`, followed by one line per packet:
+With a proxy sending, `proxy_receiver` prints one line per packet:
 
 ```
-  12.35s #241      steer   -8123  thr  +31002  brk      +0    - - - - --- --- -- --   raw:
+Receive state (Pkt:      F1) :  Wheel: -8123 | Throttle: 31002 | Brake: 0
 ```
 
-| Column | Meaning |
+| Field | Meaning |
 |---|---|
-| `12.35s` | time since the monitor started |
-| `#241` | packet counter from the proxy |
-| `steer` / `thr` / `brk` | raw `lX` / `lY` / `lRz` values from the struct |
-| `A B X Y LSB RSB PL PR` | button name when pressed, dashes when not (`PL`/`PR` are the left and right paddles) |
-| `raw:` | index of every pressed button in `rgbButtons[]` (only with `-r`) |
+| `Pkt` | the proxy's packet counter, in hex |
+| `Wheel` | `lX` from the struct: steering |
+| `Throttle` | `lY` |
+| `Brake` | `lRz` |
 
 Work through this checklist and **record what you actually see**:
 
 | Action | Mac proxy expected | Record |
 |---|---|---|
-| Wheel full left, then full right | `steer` about −32767 → +32767 | |
-| Gas released, then fully pressed | `thr` 0 → about +32767 | |
-| Brake released, then fully pressed | `brk` 0 → about +32767 | |
-| Press A, B, X, Y, LSB, RSB, left paddle, right paddle, one at a time | a number appears after `raw:` | index for each button |
+| Wheel full left, then full right | `Wheel` about −32767 → +32767 | |
+| Gas released, then fully pressed | `Throttle` 0 → about +32767 | |
+| Brake released, then fully pressed | `Brake` 0 → about +32767 | |
+| Both proxies running in turn, same controls | the two should agree | |
 
-About the button and pedal values:
+**Windows is the reference.** On Windows, record `Wheel`, `Throttle` and
+`Brake` at rest and at full travel. The pedal range there may differ from the
+Mac proxy's 0 → +32767, for example running from positive when released to
+negative when pressed. If they differ, the Mac proxy's scaling is what changes,
+so that the Pi never has to know which proxy is upstream.
 
-- **Button names are provisional.** The name table in `wheel_monitor.c` uses
-  the commonly cited Windows indices for the G920, which haven't been
-  confirmed on this setup yet. The Mac proxy currently passes SDL's own
-  button numbers through, and those differ from Windows. So a button may show
-  under the wrong name or not at all. The `raw:` numbers are what matter:
-  record them.
-- **Windows is the reference.** On Windows, record the steer, throttle, and
-  brake values at rest and at full travel. The pedal range there may differ
-  from the Mac proxy's 0 → +32767, for example running from positive when
-  released to negative when pressed. That's exactly what this step is meant to
-  find out.
-
-To slow the output down, restart the monitor with `./wheel_monitor -r -n 5`.
+The counter is the cheapest diagnostic in the system: steadily increasing means
+the link is healthy, jumps mean dropped UDP packets, a frozen counter means the
+proxy stalled, and a counter that restarts at 0 means the proxy was restarted.
 
 ### Done when
 
-- Steering, throttle, and brake all respond to the controls.
-- The packet counter increases steadily, with at most occasional `lost`
-  messages.
-- You have recorded the `raw:` index for each of the eight buttons, and the
-  steer, throttle, and brake values at rest and at full travel.
+- Steering, throttle and brake all respond to the controls.
+- The packet counter increases steadily.
+- The force values appear on the laptop side, showing the return path works.
+- You have recorded the steer, throttle and brake values at rest and at full
+  travel, for whichever proxy you used.
 
 ---
 
@@ -290,13 +297,13 @@ To slow the output down, restart the monitor with `./wheel_monitor -r -n 5`.
 
 | Symptom | Likely cause |
 |---|---|
-| `-- no packets` forever | Wrong `<pi-ip>` in the proxy (run `hostname -I` again). The laptop and Pi are on different networks. Campus Wi-Fi may be blocking device-to-device traffic, in which case use an Ethernet cable. Test with `ping <pi-ip>` from the laptop. |
-| `bind (is receiver or another monitor already running?)` | Something else already has port 8000, usually `receiver.c` or a second monitor. Stop it. |
-| `!! N packet(s) lost` now and then | Normal on Wi-Fi. If it's constant, switch to Ethernet. |
-| `!! counter went X -> 0: proxy restarted` | The proxy was restarted. Expected. |
-| `!! N-byte packet ... ignored` | Something other than a wheel proxy is sending to port 8000. |
+| `bind failed: Cannot assign requested address` | `LOCAL_HOST` in `receiver.c` isn't this Pi's address. Re-check `hostname -I`, edit, and recompile. |
+| `bind failed: Address already in use` | Another copy of `proxy_receiver` is still running. Stop it. |
+| `undefined reference to 'pthread_create'` | `-pthread` was left off the `gcc` command. |
+| `Send force` lines but no `Receive state` lines | Wrong `REMOTE_HOST` in the proxy, laptop and Pi on different networks, or campus Wi-Fi blocking device-to-device traffic (use an Ethernet cable). Test with `ping <pi-ip>` from the laptop. |
+| Packet counter jumps around | Dropped UDP packets. Normal on Wi-Fi now and then; constant drops mean switch to Ethernet. |
 | Pi reboots, freezes, or SSH drops | Undervoltage. Run `vcgencmd get_throttled`; anything other than `0x0` means the power supply is inadequate. Use the official 5 V 3 A USB-C supply. |
-| `fatal error: state.h: No such file or directory` | `state.h` isn't in the same folder as `wheel_monitor.c`. |
+| `fatal error: state.h: No such file or directory` | `state.h` isn't in the same folder as `receiver.c`. |
 
 ### Mac proxy
 
@@ -308,6 +315,7 @@ To slow the output down, restart the monitor with `./wheel_monitor -r -n 5`.
 | `No matching distribution found for pygame` | You installed `pygame` instead of `pygame-ce`. |
 | `externally-managed-environment` from pip | The virtual environment isn't active. Run `source .venv/bin/activate`. |
 | `ModuleNotFoundError: No module named 'pygame'` | The virtual environment isn't active in this Terminal window. |
+| `force --` never changes | The Pi's receiver isn't running, or its `REMOTE_HOST` isn't this laptop. |
 
 ### Windows proxy
 
@@ -318,5 +326,5 @@ To slow the output down, restart the monitor with `./wheel_monitor -r -n 5`.
 | `ModuleNotFoundError: No module named 'PyQt5'` | The virtual environment isn't active, or `pip install PyQt5` was skipped. |
 | Clicking **connect** prints nothing, or not `connected ...` | The Logitech software isn't installed or running, or Windows's generic driver took over (see 2B.1). Try the other Logitech software. |
 | The window's numbers don't move | The wheel hasn't finished calibrating, or the SDK lost the device. Click **stop**, unplug and replug the wheel, then click **connect**. |
-| Values move in the window but the Pi sees nothing | Wrong `REMOTE_HOST`, the laptop and Pi are on different networks, or the firewall blocked Python. |
-| Console floods with `No data` | Expected with `wheel_monitor` (see 2B.6). |
+| Values move in the window but the Pi sees nothing | Wrong `REMOTE_HOST`, laptop and Pi on different networks, or the firewall blocked Python. |
+| Console prints `No data` constantly | The Pi's receiver isn't running or can't reach this laptop (check `REMOTE_HOST` in `receiver.c`). |
